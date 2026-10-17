@@ -8,6 +8,7 @@ import {
   GameEvent,
   PLAYER_MAX_HP,
   WeaponId,
+  ButtonBits,
 } from "@veylcore/shared";
 import { Camera } from "../render/camera";
 import { CanvasRenderer } from "../render/canvasRenderer";
@@ -15,6 +16,10 @@ import { InputManager } from "../input/inputManager";
 import { NetworkClient } from "../net/networkClient";
 import { LocalConnection } from "../net/localConnection";
 import { WsConnection } from "../net/wsConnection";
+import { Predictor } from "../net/predictor";
+import { Interpolator } from "../net/interpolator";
+import { LocalProjectiles } from "../net/localProjectiles";
+import { LatencySimulator } from "../net/latencySimulator";
 import { GameHud } from "../ui/hud";
 import { MainMenu } from "../ui/menu";
 
@@ -25,6 +30,7 @@ export class GameApp {
   private inputManager: InputManager;
   private localConnection: LocalConnection;
   private wsConnection: WsConnection;
+  private latencySim: LatencySimulator;
   private activeConnection: NetworkClient;
   private hud: GameHud;
   private menu: MainMenu;
@@ -35,10 +41,10 @@ export class GameApp {
   private isOnline = false;
   private nickname = "Player";
 
-  // Online state directly driven by server authoritative snapshots (P2: No prediction)
-  private onlineLocalPlayer: SimPlayer;
-  private onlineOtherPlayers: Map<number, SimPlayer> = new Map();
-  private onlineProjectiles: SimProjectile[] = [];
+  // P3 Netcode components
+  private predictor: Predictor;
+  private interpolator: Interpolator;
+  private localProjectiles: LocalProjectiles;
 
   // Timing & fixed timestep accumulator
   private lastTime = 0;
@@ -60,11 +66,12 @@ export class GameApp {
 
     this.localConnection = new LocalConnection();
     this.wsConnection = new WsConnection();
+    this.latencySim = new LatencySimulator(this.wsConnection);
     this.activeConnection = this.localConnection;
 
-    // Default player placeholder
+    // Initialize P3 netcode components
     const spawn0 = defaultMap.spawnPoints[0] || { x: 200, y: 200 };
-    this.onlineLocalPlayer = {
+    const initialPlayer: SimPlayer = {
       eid: 1,
       x: spawn0.x,
       y: spawn0.y,
@@ -83,10 +90,21 @@ export class GameApp {
       continuousFireShots: 0,
     };
 
+    this.predictor = new Predictor(initialPlayer);
+    this.interpolator = new Interpolator();
+    this.localProjectiles = new LocalProjectiles();
+
     // Pre-render floor tiles for high rendering performance
     this.renderer.preRenderFloor(this.mapQuery);
 
-    this.hud = new GameHud(hudContainer);
+    this.hud = new GameHud(hudContainer, {
+      onSetSimulatedLatency: (rtt, jitter) => {
+        this.latencySim.setLatency(rtt, jitter);
+      },
+      onTriggerFreeze: () => {
+        this.latencySim.triggerFreeze(1000);
+      },
+    });
     this.hud.setVisible(false);
 
     this.menu = new MainMenu(menuContainer, {
@@ -108,115 +126,43 @@ export class GameApp {
       });
     });
 
-    // Wire up online WebSocket snapshots and events
+    // Wire up online WebSocket snapshots and events via LatencySimulator
     this.setupOnlineListeners();
 
     this.bindEvents();
   }
 
   private setupOnlineListeners(): void {
-    this.wsConnection.onSnapshot((snap: SnapshotMsg) => {
+    this.latencySim.onSnapshot((snap: SnapshotMsg) => {
       if (!this.isOnline) return;
 
-      // 1. Update local player directly from server authoritative snapshot (P2)
+      // 1. Pass to Interpolator for smooth entity buffer playback
+      this.interpolator.pushSnapshot(snap);
+
+      // 2. Reconcile local player prediction with server authoritative baseline (P3)
       if (snap.you) {
-        this.onlineLocalPlayer.eid = snap.you.eid;
-        this.onlineLocalPlayer.x = snap.you.x;
-        this.onlineLocalPlayer.y = snap.you.y;
-        this.onlineLocalPlayer.hp = snap.you.hp;
-        this.onlineLocalPlayer.isDead = snap.you.st === "dead";
-        this.onlineLocalPlayer.activeSlot = snap.you.w;
-
-        if (snap.you.pri) {
-          this.onlineLocalPlayer.primaryWeapon = snap.you.pri.id;
-          this.onlineLocalPlayer.primaryMag = snap.you.pri.mag;
-          this.onlineLocalPlayer.primaryReserve = snap.you.pri.res;
-        }
-        if (snap.you.sec) {
-          this.onlineLocalPlayer.secondaryMag = snap.you.sec.mag;
-        }
-      }
-
-      // 2. Update other players
-      const currentEids = new Set<number>();
-      for (const ent of snap.e) {
-        if (ent[1] === 1) {
-          // Player kind
-          const [eid, , x, y, aim, hp, weaponId] = ent;
-          currentEids.add(eid);
-
-          let p = this.onlineOtherPlayers.get(eid);
-          if (!p) {
-            p = {
-              eid,
-              x,
-              y,
-              vx: 0,
-              vy: 0,
-              aimAngle: aim,
-              hp,
-              isDead: hp <= 0,
-              activeSlot: 0,
-              primaryWeapon: (weaponId as WeaponId) || "k2",
-              primaryMag: 30,
-              primaryReserve: 90,
-              secondaryMag: 12,
-              reloadTimerSec: 0,
-              fireCooldownSec: 0,
-              continuousFireShots: 0,
-            };
-            this.onlineOtherPlayers.set(eid, p);
-          } else {
-            p.x = x;
-            p.y = y;
-            p.aimAngle = aim;
-            p.hp = hp;
-            p.isDead = hp <= 0;
-            p.primaryWeapon = (weaponId as WeaponId) || "k2";
-          }
-        }
-      }
-
-      // Remove disconnected players
-      for (const eid of this.onlineOtherPlayers.keys()) {
-        if (!currentEids.has(eid)) {
-          this.onlineOtherPlayers.delete(eid);
-        }
+        this.predictor.reconcile(snap.you, snap.ack, this.mapQuery);
       }
     });
 
-    this.wsConnection.onEvent((ev: GameEvent) => {
+    this.latencySim.onEvent((ev: GameEvent) => {
       if (!this.isOnline) return;
+      const myEid = this.wsConnection.getMyEid() || 1;
 
       if (ev.k === "shot") {
-        this.renderer.addEffect({
-          type: "flash",
-          x: ev.x,
-          y: ev.y,
-          angle: ev.a,
-          life: 0.06,
-          maxLife: 0.06,
-        });
-
-        // Add visual projectile
-        this.onlineProjectiles.push({
-          id: ev.prj,
-          ownerEid: ev.o,
-          inputSeq: ev.s,
-          weaponId: ev.w,
-          x: ev.x,
-          y: ev.y,
-          prevX: ev.x,
-          prevY: ev.y,
-          vx: Math.cos(ev.a) * ev.v,
-          vy: Math.sin(ev.a) * ev.v,
-          speed: ev.v,
-          remainingRange: ev.r,
-          damage: 20,
-          alive: true,
-          spawnTick: ev.tk,
-        });
+        this.localProjectiles.handleServerShot(ev, myEid);
+        if (ev.o !== myEid) {
+          this.renderer.addEffect({
+            type: "flash",
+            x: ev.x,
+            y: ev.y,
+            angle: ev.a,
+            life: 0.06,
+            maxLife: 0.06,
+          });
+        }
       } else if (ev.k === "pend") {
+        this.localProjectiles.handleServerPend(ev.prj);
         if (ev.why === "wall") {
           this.renderer.addEffect({
             type: "spark",
@@ -226,16 +172,15 @@ export class GameApp {
             maxLife: 0.2,
           });
         }
-        // Remove projectile
-        const idx = this.onlineProjectiles.findIndex((p) => p.id === ev.prj);
-        if (idx !== -1) {
-          this.onlineProjectiles.splice(idx, 1);
-        }
+      } else if (ev.k === "deny") {
+        this.localProjectiles.handleServerDeny(ev.s);
       } else if (ev.k === "hit") {
         const victim =
-          ev.v === this.onlineLocalPlayer.eid
-            ? this.onlineLocalPlayer
-            : this.onlineOtherPlayers.get(ev.v);
+          ev.v === myEid
+            ? this.predictor.getPlayer()
+            : this.interpolator
+                .getInterpolatedEntities(myEid)
+                .find((p) => p.eid === ev.v);
         if (victim) {
           this.renderer.addEffect({
             type: "hit",
@@ -265,6 +210,7 @@ export class GameApp {
     this.nickname = nickname;
     this.isOnline = false;
     this.activeConnection = this.localConnection;
+    this.hud.setMode(false);
     this.startGameCommon();
     this.localConnection.connect("local_offline", nickname);
   }
@@ -272,12 +218,12 @@ export class GameApp {
   public async startOnlineGame(nickname: string, roomCode: string): Promise<void> {
     this.nickname = nickname;
     this.isOnline = true;
-    this.activeConnection = this.wsConnection;
-    this.onlineOtherPlayers.clear();
-    this.onlineProjectiles = [];
+    this.activeConnection = this.latencySim;
+    this.hud.setMode(true);
+    this.localProjectiles.clear();
 
     try {
-      await this.wsConnection.connect(roomCode, nickname);
+      await this.activeConnection.connect(roomCode, nickname);
       this.startGameCommon();
     } catch (err) {
       alert(`온라인 연결 실패: ${err instanceof Error ? err.message : String(err)}\n서버 상태를 확인해 주세요.`);
@@ -340,12 +286,12 @@ export class GameApp {
     if (!this.isPaused) {
       this.accumulator += frameDelta;
 
-      // Get current player for input sampling
+      // Get current player position for input sampling
       const activePlayer = this.isOnline
-        ? this.onlineLocalPlayer
+        ? this.predictor.getPlayer()
         : this.localConnection.getServer().getLocalPlayer();
 
-      // Convert screen mouse position to in-game world position using camera
+      // Convert screen mouse to world coordinates using camera
       const screenMouse = this.inputManager.getScreenMouse();
       const worldMouse = this.camera.screenToWorld(
         screenMouse.x,
@@ -353,49 +299,107 @@ export class GameApp {
       );
       this.inputManager.updateWorldMouse(worldMouse.x, worldMouse.y);
 
-      // Fixed timestep: 30Hz steps
+      // Fixed timestep: 30Hz simulation steps
       let steps = 0;
       while (this.accumulator >= FIXED_DELTA && steps < 5) {
         const cmd = this.inputManager.sampleCommand(
           activePlayer.x,
           activePlayer.y
         );
-        this.activeConnection.sendInput(cmd);
+
+        if (this.isOnline) {
+          // P3: Predict movement immediately on client
+          this.predictor.predictStep(cmd, this.mapQuery);
+
+          // P3: Immediate predicted shot on left-click trigger
+          const isFirePressed = (cmd.b & ButtonBits.FIRE) !== 0;
+          const currentMag =
+            activePlayer.activeSlot === 0
+              ? activePlayer.primaryMag
+              : activePlayer.secondaryMag;
+
+          if (isFirePressed && currentMag > 0 && activePlayer.reloadTimerSec <= 0) {
+            const activeWeapon =
+              activePlayer.activeSlot === 0
+                ? activePlayer.primaryWeapon
+                : "pistol";
+
+            const muzzleDist = 20;
+            const spawnX = activePlayer.x + Math.cos(cmd.a) * muzzleDist;
+            const spawnY = activePlayer.y + Math.sin(cmd.a) * muzzleDist;
+
+            this.localProjectiles.spawnLocalPredicted(
+              activePlayer.eid,
+              cmd.s,
+              activeWeapon,
+              spawnX,
+              spawnY,
+              cmd.a
+            );
+
+            this.renderer.addEffect({
+              type: "flash",
+              x: spawnX,
+              y: spawnY,
+              angle: cmd.a,
+              life: 0.06,
+              maxLife: 0.06,
+            });
+          }
+
+          // Send input to server via latency simulator
+          this.activeConnection.sendInput(cmd);
+        } else {
+          // P1: Local fake server
+          this.activeConnection.sendInput(cmd);
+        }
+
         this.accumulator -= FIXED_DELTA;
         steps++;
       }
 
-      // Update online visual projectiles
+      // Render & HUD updates
       if (this.isOnline) {
-        for (let i = this.onlineProjectiles.length - 1; i >= 0; i--) {
-          const prj = this.onlineProjectiles[i];
-          const dist = prj.speed * frameDelta;
-          prj.x += (prj.vx / prj.speed) * dist;
-          prj.y += (prj.vy / prj.speed) * dist;
-          prj.remainingRange -= dist;
-          if (prj.remainingRange <= 0) {
-            this.onlineProjectiles.splice(i, 1);
-          }
-        }
-      }
+        // P3: Smooth visual error decay over ~100ms
+        this.predictor.updateVisualSmoothing(frameDelta);
+        const visualPos = this.predictor.getVisualPosition();
 
-      // Update DOM HUD
-      this.hud.update(activePlayer, this.currentFps);
+        // Update local predicted and remote visual projectiles
+        this.localProjectiles.step(frameDelta);
 
-      // Render frame
-      if (this.isOnline) {
-        // P2: Draw snapshot positions directly
+        // Get smoothly interpolated positions for other players
+        const myEid = this.wsConnection.getMyEid() || activePlayer.eid;
+        const otherPlayers = this.interpolator.getInterpolatedEntities(myEid);
+
+        // Update HUD with Net Graph info
+        this.hud.update(activePlayer, this.currentFps, {
+          rtt: this.activeConnection.getPing(),
+          jitter: this.latencySim.getJitter(),
+          interpDelayMs: this.interpolator.getInterpDelayMs(),
+          interpDelayTicks: this.interpolator.getInterpDelayTicks(),
+          reconcileCount: this.predictor.getReconcileCount(),
+          lastError: this.predictor.getLastReconcileError(),
+        });
+
+        // Render scene using client-side predicted player with visual smoothing
+        const renderedLocalPlayer: SimPlayer = {
+          ...activePlayer,
+          x: visualPos.x,
+          y: visualPos.y,
+        };
+
         this.renderer.render(
           this.mapQuery,
-          this.onlineLocalPlayer,
-          Array.from(this.onlineOtherPlayers.values()),
-          this.onlineProjectiles,
+          renderedLocalPlayer,
+          otherPlayers,
+          this.localProjectiles.getActiveProjectiles(),
           worldMouse,
           this.nickname,
           frameDelta
         );
       } else {
         const localServer = this.localConnection.getServer();
+        this.hud.update(localServer.getLocalPlayer(), this.currentFps);
         this.renderer.render(
           this.mapQuery,
           localServer.getLocalPlayer(),

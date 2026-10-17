@@ -31,6 +31,7 @@ interface ConnectedPlayer {
   buffer: InputBuffer;
   sim: SimPlayer;
   lastAckSeq: number;
+  rtt: number;
 }
 
 export class RoomDO {
@@ -90,6 +91,19 @@ export class RoomDO {
         return;
       }
 
+      // Pong (RTT measurement)
+      if (t === "pong" && assignedPid) {
+        const player = this.players.get(assignedPid);
+        if (player) {
+          const sentTime = (d as { n?: number })?.n;
+          if (typeof sentTime === "number") {
+            const sampleRtt = Math.max(0, Date.now() - sentTime);
+            player.rtt = player.rtt === 0 ? sampleRtt : Math.round(player.rtt * 0.8 + sampleRtt * 0.2);
+          }
+        }
+        return;
+      }
+
       // Hello
       if (t === "hello") {
         if (assignedPid) return; // Already welcomed
@@ -138,6 +152,7 @@ export class RoomDO {
           buffer: new InputBuffer(),
           sim: simPlayer,
           lastAckSeq: 0,
+          rtt: 0,
         };
 
         this.players.set(pid, player);
@@ -290,7 +305,7 @@ export class RoomDO {
       if (isFireHeld && sim.reloadTimerSec <= 0 && sim.fireCooldownSec <= 0) {
         const mag = sim.activeSlot === 0 ? sim.primaryMag : sim.secondaryMag;
         if (mag > 0) {
-          this.fireWeapon(sim, weaponDef, cmd.a, cmd.s);
+          this.fireWeapon(sim, weaponDef, cmd.a, cmd.s, player.rtt);
         } else {
           this.startReload(sim, weaponDef);
         }
@@ -330,7 +345,19 @@ export class RoomDO {
       }
     }
 
-    // 3. 15Hz Snapshot broadcast (every even tick)
+    // 3. Periodic Ping (1Hz = once every 30 ticks)
+    if (this.serverTick % 30 === 0) {
+      const now = Date.now();
+      for (const p of this.players.values()) {
+        try {
+          p.ws.send(JsonCodec.encode("ping", { n: now }));
+        } catch {
+          // Socket closed
+        }
+      }
+    }
+
+    // 4. 15Hz Snapshot broadcast (every even tick)
     if (this.serverTick % 2 === 0) {
       this.broadcastSnapshots();
       this.pendingEvents = [];
@@ -379,7 +406,7 @@ export class RoomDO {
           eq: null,
           speedMul: getWeaponDef(mySim.activeSlot === 0 ? mySim.primaryWeapon : "pistol").moveMultiplier,
           zoom: false,
-          rtt: 0,
+          rtt: player.rtt,
         },
         e: otherEntities,
         ev: this.pendingEvents,
@@ -416,11 +443,15 @@ export class RoomDO {
     }
   }
 
+  /**
+   * Fires a weapon with Lag Compensation B (D4: fast-forwards projectile by min(RTT/2, 100ms))
+   */
   private fireWeapon(
     player: SimPlayer,
     def: ReturnType<typeof getWeaponDef>,
     aimAngle: number,
-    inputSeq: number
+    inputSeq: number,
+    playerRtt: number = 0
   ): void {
     if (player.activeSlot === 0) {
       player.primaryMag--;
@@ -438,6 +469,10 @@ export class RoomDO {
     const prjId = this.nextPrjId++;
     const vx = Math.cos(aimAngle) * def.projectileSpeed;
     const vy = Math.sin(aimAngle) * def.projectileSpeed;
+
+    // Lag compensation B: forward by min(RTT/2, 100ms)
+    const lagCompSec = Math.min(0.1, Math.max(0, playerRtt / 2000));
+    const advanceDist = def.projectileSpeed * lagCompSec;
 
     const prj: SimProjectile = {
       id: prjId,
@@ -457,20 +492,50 @@ export class RoomDO {
       spawnTick: this.serverTick,
     };
 
-    this.projectiles.push(prj);
+    // If lag compensation applies, immediately sweep through the advance distance
+    if (advanceDist > 0) {
+      const allLivingPlayers = Array.from(this.players.values()).map((p) => p.sim);
+      const sweepRes = stepProjectileSweep(prj, this.map, allLivingPlayers, lagCompSec);
 
-    // Broadcast shot event
+      if (sweepRes.ended) {
+        if (sweepRes.hitWall) {
+          this.pendingEvents.push({
+            k: "pend",
+            prj: prj.id,
+            x: prj.x,
+            y: prj.y,
+            why: "wall",
+          });
+        }
+        if (sweepRes.hitPlayerEid !== null) {
+          this.pendingEvents.push({
+            k: "hit",
+            v: sweepRes.hitPlayerEid,
+            a: prj.ownerEid,
+            dmg: prj.damage,
+            w: prj.weaponId,
+          });
+          this.applyDamage(sweepRes.hitPlayerEid, prj.damage, prj.ownerEid);
+        }
+      } else {
+        this.projectiles.push(prj);
+      }
+    } else {
+      this.projectiles.push(prj);
+    }
+
+    // Broadcast shot event for visual effects
     this.pendingEvents.push({
       k: "shot",
       prj: prjId,
       o: player.eid,
       s: inputSeq,
       w: def.id,
-      x: Math.round(spawnX),
-      y: Math.round(spawnY),
+      x: Math.round(prj.x),
+      y: Math.round(prj.y),
       a: Number(aimAngle.toFixed(2)),
       v: def.projectileSpeed,
-      r: def.range,
+      r: prj.remainingRange,
       tk: this.serverTick,
     });
   }
