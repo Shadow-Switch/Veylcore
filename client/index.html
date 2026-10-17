@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Veylcore — 2D Top-down Arena Shooter</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 2D Canvas Layer for Game World Rendering -->
+      <canvas id="game-canvas"></canvas>
+
+      <!-- DOM HUD Layer (Health, Ammo, Controls, Debug) -->
+      <div id="hud-layer"></div>
+
+      <!-- DOM Menu & Modal Layer (Main Menu, Lobby, Pause) -->
+      <div id="menu-layer"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

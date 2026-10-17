@@ -1,0 +1,14 @@
+{
+  "name": "@veylcore/tools",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@veylcore/shared": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
